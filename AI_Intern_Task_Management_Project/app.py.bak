@@ -1,0 +1,660 @@
+
+import os
+import io
+import csv
+import json
+import uuid
+import sqlite3
+import smtplib
+import threading
+from datetime import datetime, date, timedelta
+from email.message import EmailMessage
+from functools import wraps
+
+import requests
+from flask import Flask, request, redirect, url_for, render_template_string, flash, send_file, abort
+from werkzeug.utils import secure_filename
+from openpyxl import Workbook, load_workbook
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# =========================
+# CONFIGURATION: EDIT HERE
+# =========================
+APP_SECRET_KEY = "change-this-to-a-long-random-secret"
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "ChangeMe123!"  # Change before using beyond a local demo
+
+# OpenAI-compatible chat API. Add your API key to enable AI answers/reviews.
+# Keep the key private; do not share this file publicly with a real key inside it.
+AI_API_KEY = ""  # paste your API key here
+AI_BASE_URL = "https://api.openai.com/v1"
+AI_MODEL = "gpt-4o-mini"
+
+# Gmail SMTP. For Gmail, use an App Password, not your normal account password.
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_EMAIL = ""       # your Gmail address
+SMTP_APP_PASSWORD = ""  # Gmail App Password
+ADMIN_NOTIFICATION_EMAIL = ""  # optional email for admin notifications
+
+# Review reminders are checked while this app is running.
+CHECK_REMINDERS_EVERY_MINUTES = 30
+UPLOAD_FOLDER = "uploads"
+DATABASE = "intern_tasks.db"
+ALLOWED_EXTENSIONS = {"pdf", "docx", "txt", "md"}
+
+app = Flask(__name__)
+app.secret_key = APP_SECRET_KEY
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs("exports", exist_ok=True)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS interns (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ intern_code TEXT UNIQUE,
+ name TEXT NOT NULL,
+ email TEXT NOT NULL,
+ task_title TEXT NOT NULL,
+ requirements TEXT DEFAULT '',
+ task_link_token TEXT UNIQUE,
+ explanation_completed INTEGER DEFAULT 0,
+ explanation_completed_at TEXT DEFAULT '',
+ review_frequency TEXT DEFAULT '2 days',
+ next_review_date TEXT DEFAULT '',
+ document_filename TEXT DEFAULT '',
+ document_text TEXT DEFAULT '',
+ missing_requirements TEXT DEFAULT '',
+ ai_suggestions TEXT DEFAULT '',
+ feedback TEXT DEFAULT '',
+ meeting_link TEXT DEFAULT '',
+ status TEXT DEFAULT 'Not Started',
+ last_email_sent TEXT DEFAULT '',
+ created_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS review_history (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ intern_id INTEGER,
+ review_date TEXT,
+ review_type TEXT,
+ notes TEXT,
+ FOREIGN KEY(intern_id) REFERENCES interns(id)
+);
+"""
+
+def db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as conn:
+        conn.executescript(SCHEMA)
+
+def now_iso():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def parse_date(value):
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(value).strip()[:10], fmt).date()
+        except ValueError:
+            pass
+    return None
+
+def review_days(frequency):
+    return 7 if str(frequency).strip().lower() in ("1 week", "one week", "weekly", "7 days") else 2
+
+def get_intern(intern_id):
+    with db() as conn:
+        return conn.execute("SELECT * FROM interns WHERE id=?", (intern_id,)).fetchone()
+
+def get_by_token(token):
+    with db() as conn:
+        return conn.execute("SELECT * FROM interns WHERE task_link_token=?", (token,)).fetchone()
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def send_email(to_email, subject, body):
+    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
+        return False, "Email is not configured. Add SMTP_EMAIL and SMTP_APP_PASSWORD at the top of app.py."
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = to_email
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+            server.send_message(msg)
+        return True, "Email sent."
+    except Exception as exc:
+        return False, str(exc)
+
+def ask_ai(system_prompt, user_prompt):
+    if not AI_API_KEY:
+        return None, "AI is not configured. Add AI_API_KEY at the top of app.py."
+    try:
+        response = requests.post(
+            AI_BASE_URL.rstrip("/") + "/chat/completions",
+            headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": AI_MODEL,
+                "temperature": 0.3,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip(), None
+    except Exception as exc:
+        return None, f"AI request failed: {exc}"
+
+def extract_text(path):
+    ext = path.rsplit(".", 1)[-1].lower()
+    try:
+        if ext in ("txt", "md"):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        if ext == "docx":
+            from docx import Document
+            doc = Document(path)
+            return "\n".join(p.text for p in doc.paragraphs)
+        if ext == "pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as exc:
+        return f"[Could not extract document text: {exc}]"
+    return ""
+
+def add_history(intern_id, review_type, notes):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO review_history (intern_id, review_date, review_type, notes) VALUES (?, ?, ?, ?)",
+            (intern_id, now_iso(), review_type, notes),
+        )
+
+def make_token():
+    return uuid.uuid4().hex
+
+def send_task_email(row, public_base_url=None):
+    if public_base_url is None:
+        public_base_url = request.url_root.rstrip("/") if request else "http://127.0.0.1:5000"
+    link = f"{public_base_url}/task/{row['task_link_token']}"
+    subject = f"Your assigned task: {row['task_title']}"
+    body = (
+        f"Hello {row['name']},\n\n"
+        f"You have been assigned a task.\n\nTask: {row['task_title']}\n"
+        f"Requirements: {row['requirements'] or 'Please check your task page.'}\n\n"
+        f"Open your personal task page: {link}\n\n"
+        f"Please use the page to hear the AI voice explanation, submit your document, and check review feedback.\n"
+    )
+    return send_email(row["email"], subject, body)
+
+def check_due_reminders():
+    today = date.today()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM interns WHERE status NOT IN ('Completed','Approved') AND next_review_date != ''"
+        ).fetchall()
+    for row in rows:
+        due = parse_date(row["next_review_date"])
+        if due and due <= today:
+            link = f"http://127.0.0.1:5000/task/{row['task_link_token']}"
+            body = (
+                f"Hello {row['name']},\n\nThis is your task review reminder.\n"
+                f"Task: {row['task_title']}\nReview date: {row['next_review_date']}\n"
+                f"Open your task page: {link}\n"
+                f"Please submit updates and review the feedback.\n"
+            )
+            ok, message = send_email(row["email"], f"Reminder: review your task - {row['task_title']}", body)
+            if ok:
+                next_date = today + timedelta(days=review_days(row["review_frequency"]))
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE interns SET last_email_sent=?, next_review_date=? WHERE id=?",
+                        (now_iso(), next_date.isoformat(), row["id"]),
+                    )
+                add_history(row["id"], "Reminder sent", f"Reminder email sent. Next review: {next_date.isoformat()}")
+            else:
+                print(f"[Reminder not sent to {row['email']}] {message}")
+
+init_db()
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(check_due_reminders, "interval", minutes=CHECK_REMINDERS_EVERY_MINUTES, id="review_reminders", replace_existing=True)
+scheduler.start()
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not request.cookies.get("admin_session") == app.secret_key:
+            return redirect(url_for("login", next=request.path))
+        return fn(*args, **kwargs)
+    return wrapper
+
+BASE_STYLE = """
+<style>
+:root{font-family:Arial,sans-serif;color:#172033;background:#f4f7fb}
+body{margin:0}header{background:#183b67;color:white;padding:18px 28px;display:flex;justify-content:space-between;align-items:center}
+main{max-width:1250px;margin:24px auto;padding:0 18px}.card{background:white;border:1px solid #dce4ef;border-radius:14px;padding:18px;margin-bottom:18px;box-shadow:0 3px 12px #183b670b}
+h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+label{display:block;font-weight:bold;margin:12px 0 5px}input,textarea,select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}
+textarea{min-height:95px}button,.btn{display:inline-block;background:#1767b1;color:white;padding:10px 14px;border:0;border-radius:8px;text-decoration:none;cursor:pointer;font:inherit}
+.btn.secondary,button.secondary{background:#e7eef7;color:#17395f}.danger{background:#a72d3b}table{width:100%;border-collapse:collapse;background:white}th,td{padding:10px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}th{background:#edf3fa}
+.small{font-size:13px;color:#5c6a7d}.pill{padding:4px 8px;background:#e5eef9;border-radius:99px;font-size:12px;white-space:nowrap}
+a{color:#145da0}audio{width:100%}.notice{padding:10px;background:#fff4d6;border-radius:8px;margin-bottom:12px}
+@media(max-width:700px){header{padding:14px;display:block}table{font-size:13px}.table-wrap{overflow-x:auto}}
+</style>
+"""
+def page(title, content):
+    return render_template_string(
+        """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{{title}}</title>""" + BASE_STYLE + """</head><body><header><strong>AI Intern Task Management</strong><span><a style="color:white" href="{{ url_for('dashboard') }}">Admin Dashboard</a></span></header><main>
+        {% with messages=get_flashed_messages() %}{% for m in messages %}<div class="card">{{m}}</div>{% endfor %}{% endwith %}
+        """ + content + """</main></body></html>""",
+        title=title,
+    )
+
+@app.route("/")
+def home():
+    return redirect(url_for("dashboard"))
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        if request.form.get("username") == ADMIN_USERNAME and request.form.get("password") == ADMIN_PASSWORD:
+            response = redirect(url_for("dashboard"))
+            response.set_cookie("admin_session", app.secret_key, httponly=True, samesite="Lax")
+            return response
+        flash("Incorrect username or password.")
+    return page("Admin Login", """
+    <div class="card" style="max-width:460px;margin:50px auto">
+    <h1>Admin Login</h1><p class="small">Default username: admin. Change the password in app.py before using.</p>
+    <form method="post"><label>Username</label><input name="username" required><label>Password</label><input type="password" name="password" required><p><button>Sign in</button></p></form></div>
+    """)
+
+@app.route("/logout")
+def logout():
+    response = redirect(url_for("login"))
+    response.delete_cookie("admin_session")
+    return response
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM interns ORDER BY id DESC").fetchall()
+    total = len(rows)
+    active = sum(1 for r in rows if r["status"] not in ("Completed", "Approved"))
+    completed = sum(1 for r in rows if r["status"] in ("Completed", "Approved"))
+    content = """
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><h1>Admin Dashboard</h1><p class="small">Manage up to 100 interns and their review cycles.</p></div><div><a class="btn secondary" href="{{url_for('export_excel')}}">Export Excel</a> <a class="btn secondary" href="{{url_for('download_template')}}">Excel Template</a> <a class="btn secondary" href="{{url_for('logout')}}">Log out</a></div></div>
+    <div class="grid">
+      <div class="card"><div class="small">Total interns</div><h2>{{total}}</h2></div>
+      <div class="card"><div class="small">Active tasks</div><h2>{{active}}</h2></div>
+      <div class="card"><div class="small">Approved / completed</div><h2>{{completed}}</h2></div>
+    </div>
+    <div class="card"><h2>Add one intern</h2>
+    <form method="post" action="{{url_for('add_intern')}}"><div class="grid">
+    <div><label>Intern ID</label><input name="intern_code" placeholder="INT-001"></div>
+    <div><label>Intern name *</label><input name="name" required></div>
+    <div><label>Email ID *</label><input type="email" name="email" required></div>
+    <div><label>Task title *</label><input name="task_title" required></div>
+    <div><label>Review frequency</label><select name="review_frequency"><option>2 days</option><option>1 week</option></select></div>
+    <div><label>Next review date</label><input type="date" name="next_review_date"></div>
+    </div><label>Task requirements</label><textarea name="requirements" placeholder="What should the intern complete?"></textarea>
+    <label>Review meeting link (optional)</label><input name="meeting_link" placeholder="https://...">
+    <p><button>Add intern and create personal link</button></p></form></div>
+    <div class="card"><h2>Import interns from Excel</h2><p class="small">Required column headings: Intern ID, Intern Name, Email ID, Assigned Task. Optional: Task Requirements, Review Frequency, Next Review Date, Review Meeting Link.</p>
+    <form method="post" action="{{url_for('import_excel')}}" enctype="multipart/form-data"><input type="file" name="file" accept=".xlsx" required><p><button>Import Excel</button></p></form></div>
+    <div class="card"><h2>Intern list</h2><div class="table-wrap"><table><thead><tr><th>ID / Name</th><th>Task</th><th>Review</th><th>Status</th><th>Personal link</th><th>Actions</th></tr></thead><tbody>
+    {% for r in rows %}<tr><td>{{r.intern_code or ('INT-' ~ r.id)}}<br><strong>{{r.name}}</strong><br><span class="small">{{r.email}}</span></td><td>{{r.task_title}}<br><span class="small">{{r.requirements[:100]}}</span></td><td>{{r.review_frequency}}<br>{{r.next_review_date}}</td><td><span class="pill">{{r.status}}</span></td><td><a href="{{url_for('intern_task', token=r.task_link_token, _external=True)}}">Open task page</a><br><button class="secondary" onclick="navigator.clipboard.writeText('{{url_for('intern_task', token=r.task_link_token, _external=True)}}')">Copy link</button></td><td><a href="{{url_for('edit_intern', intern_id=r.id)}}">Edit</a><br><a href="{{url_for('send_initial_email', intern_id=r.id)}}">Send task email</a><br><a href="{{url_for('history', intern_id=r.id)}}">History</a></td></tr>{% endfor %}
+    </tbody></table></div></div>
+    """
+    return render_template_string(
+        """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Dashboard</title>""" + BASE_STYLE + """</head><body><header><strong>AI Intern Task Management</strong><span><a style="color:white" href="{{url_for('logout')}}">Log out</a></span></header><main>
+        {% with messages=get_flashed_messages() %}{% for m in messages %}<div class="card">{{m}}</div>{% endfor %}{% endwith %}
+        """ + content + """</main></body></html>""",
+        total=total, active=active, completed=completed, rows=rows,
+    )
+
+@app.route("/intern/add", methods=["POST"])
+@login_required
+def add_intern():
+    name = request.form.get("name", "").strip()
+    email = request.form.get("email", "").strip()
+    task_title = request.form.get("task_title", "").strip()
+    if not name or not email or not task_title:
+        flash("Name, email and task title are required.")
+        return redirect(url_for("dashboard"))
+    frequency = request.form.get("review_frequency", "2 days")
+    next_date = request.form.get("next_review_date") or (date.today() + timedelta(days=review_days(frequency))).isoformat()
+    token = make_token()
+    code = request.form.get("intern_code", "").strip() or f"INT-{uuid.uuid4().hex[:6].upper()}"
+    try:
+        with db() as conn:
+            conn.execute("""INSERT INTO interns (intern_code,name,email,task_title,requirements,task_link_token,review_frequency,next_review_date,meeting_link,status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (code, name, email, task_title, request.form.get("requirements","").strip(), token, frequency, next_date, request.form.get("meeting_link","").strip(), "Not Started", now_iso()))
+        flash(f"Intern added. Personal task link: {request.url_root.rstrip('/')}/task/{token}")
+    except sqlite3.IntegrityError:
+        flash("That Intern ID already exists. Use a different ID.")
+    return redirect(url_for("dashboard"))
+
+@app.route("/intern/<int:intern_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_intern(intern_id):
+    r = get_intern(intern_id)
+    if not r: abort(404)
+    if request.method == "POST":
+        frequency = request.form.get("review_frequency", "2 days")
+        next_date = request.form.get("next_review_date") or (date.today() + timedelta(days=review_days(frequency))).isoformat()
+        with db() as conn:
+            conn.execute("""UPDATE interns SET intern_code=?,name=?,email=?,task_title=?,requirements=?,review_frequency=?,next_review_date=?,meeting_link=?,status=? WHERE id=?""",
+            (request.form.get("intern_code","").strip(), request.form.get("name","").strip(), request.form.get("email","").strip(), request.form.get("task_title","").strip(), request.form.get("requirements","").strip(), frequency, next_date, request.form.get("meeting_link","").strip(), request.form.get("status","In Progress"), intern_id))
+        flash("Intern updated.")
+        return redirect(url_for("dashboard"))
+    return page("Edit Intern", """
+    <div class="card"><h1>Edit intern</h1><form method="post">
+    <div class="grid"><div><label>Intern ID</label><input name="intern_code" value="{{r.intern_code}}"></div>
+    <div><label>Name</label><input name="name" value="{{r.name}}" required></div>
+    <div><label>Email</label><input name="email" type="email" value="{{r.email}}" required></div>
+    <div><label>Task title</label><input name="task_title" value="{{r.task_title}}" required></div>
+    <div><label>Review frequency</label><select name="review_frequency"><option {% if r.review_frequency=='2 days' %}selected{% endif %}>2 days</option><option {% if r.review_frequency=='1 week' %}selected{% endif %}>1 week</option></select></div>
+    <div><label>Next review date</label><input type="date" name="next_review_date" value="{{r.next_review_date}}"></div>
+    <div><label>Status</label><select name="status">{% for s in ['Not Started','In Progress','Under Review','Changes Required','Approved','Completed'] %}<option {% if r.status==s %}selected{% endif %}>{{s}}</option>{% endfor %}</select></div></div>
+    <label>Requirements</label><textarea name="requirements">{{r.requirements}}</textarea><label>Meeting link</label><input name="meeting_link" value="{{r.meeting_link}}">
+    <p><button>Save changes</button> <a class="btn secondary" href="{{url_for('dashboard')}}">Cancel</a></p></form></div>
+    """).replace("{{r.", "{{r.") if False else render_template_string(
+        """<!doctype html><html><head><meta charset="utf-8">""" + BASE_STYLE + """</head><body><header><strong>AI Intern Task Management</strong><a style="color:white" href="{{url_for('dashboard')}}">Dashboard</a></header><main><div class="card"><h1>Edit intern</h1><form method="post">
+    <div class="grid"><div><label>Intern ID</label><input name="intern_code" value="{{r.intern_code}}"></div><div><label>Name</label><input name="name" value="{{r.name}}" required></div><div><label>Email</label><input name="email" type="email" value="{{r.email}}" required></div><div><label>Task title</label><input name="task_title" value="{{r.task_title}}" required></div><div><label>Review frequency</label><select name="review_frequency"><option {% if r.review_frequency=='2 days' %}selected{% endif %}>2 days</option><option {% if r.review_frequency=='1 week' %}selected{% endif %}>1 week</option></select></div><div><label>Next review date</label><input type="date" name="next_review_date" value="{{r.next_review_date}}"></div><div><label>Status</label><select name="status">{% for s in ['Not Started','In Progress','Under Review','Changes Required','Approved','Completed'] %}<option {% if r.status==s %}selected{% endif %}>{{s}}</option>{% endfor %}</select></div></div><label>Requirements</label><textarea name="requirements">{{r.requirements}}</textarea><label>Meeting link</label><input name="meeting_link" value="{{r.meeting_link}}"><p><button>Save changes</button> <a class="btn secondary" href="{{url_for('dashboard')}}">Cancel</a></p></form></div></main></body></html>""", r=r)
+
+@app.route("/intern/<int:intern_id>/send-email")
+@login_required
+def send_initial_email(intern_id):
+    r = get_intern(intern_id)
+    if not r: abort(404)
+    ok, msg = send_task_email(r)
+    flash("Task email sent." if ok else f"Email not sent: {msg}")
+    if ok:
+        with db() as conn:
+            conn.execute("UPDATE interns SET last_email_sent=? WHERE id=?", (now_iso(), intern_id))
+        add_history(intern_id, "Task email", "Initial task email sent.")
+    return redirect(url_for("dashboard"))
+
+@app.route("/task/<token>", methods=["GET", "POST"])
+def intern_task(token):
+    r = get_by_token(token)
+    if not r: abort(404)
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "feedback":
+            feedback = request.form.get("feedback", "").strip()
+            with db() as conn:
+                conn.execute("UPDATE interns SET feedback=? WHERE id=?", (feedback, r["id"]))
+            add_history(r["id"], "Intern feedback", feedback)
+            flash("Thank you. Your feedback has been saved.")
+        elif action == "document":
+            file = request.files.get("document")
+            if not file or not file.filename:
+                flash("Choose a document first.")
+            elif not allowed_file(file.filename):
+                flash("Allowed formats: PDF, DOCX, TXT, MD.")
+            else:
+                filename = secure_filename(file.filename)
+                unique_name = f"{r['id']}_{uuid.uuid4().hex[:8]}_{filename}"
+                path = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
+                file.save(path)
+                doc_text = extract_text(path)
+                with db() as conn:
+                    conn.execute("UPDATE interns SET document_filename=?,document_text=?,status='Under Review' WHERE id=?", (unique_name, doc_text, r["id"]))
+                add_history(r["id"], "Document submitted", filename)
+                flash("Document submitted. Use AI review below to check it against the task requirements.")
+        elif action == "review":
+            current = get_intern(r["id"])
+            if not current["document_text"]:
+                flash("Submit a document before requesting a review.")
+            else:
+                prompt = f"""Review this intern submission against the task requirements.
+Task: {current['task_title']}
+Requirements:
+{current['requirements']}
+Document text:
+{current['document_text'][:18000]}
+
+Return these sections in simple, respectful, human-friendly language:
+1. Overall summary
+2. Requirements completed
+3. Missing requirements
+4. Errors or unclear parts
+5. Specific improvements and enhancements
+6. Recommended next actions
+Do not claim something is missing unless it is not supported by the provided document. If AI is unavailable, tell the user to configure the API key."""
+                result, err = ask_ai("You are a careful intern mentor. Give specific, constructive feedback in plain language.", prompt)
+                if result:
+                    with db() as conn:
+                        conn.execute("UPDATE interns SET missing_requirements=?,ai_suggestions=? WHERE id=?", (result, result, r["id"]))
+                    add_history(r["id"], "AI document review", result[:1500])
+                    ok, emsg = send_email(current["email"], f"Document review feedback: {current['task_title']}", f"Hello {current['name']},\n\nYour document review is ready.\n\n{result}\n\nOpen your task page to continue: {request.url_root.rstrip('/')}/task/{token}")
+                    flash("AI review completed." + (" Feedback email sent." if ok else f" Review saved; email not sent: {emsg}"))
+                else:
+                    flash(err)
+        elif action == "complete_explanation":
+            with db() as conn:
+                conn.execute("UPDATE interns SET explanation_completed=1,explanation_completed_at=? WHERE id=?", (now_iso(), r["id"]))
+            add_history(r["id"], "Explanation completed", "Intern marked the voice explanation as completed.")
+            current = get_intern(r["id"])
+            ok, msg = send_email(current["email"], f"Task explanation completed: {current['task_title']}", f"Hello {current['name']},\n\nYou marked the task explanation as completed.\nYour next review is scheduled for {current['next_review_date']}.\nTask page: {request.url_root.rstrip('/')}/task/{token}\n\nPlease submit your document and use the review feedback to improve it.")
+            flash("Explanation completion saved." + (" Confirmation email sent." if ok else f" Email not sent: {msg}"))
+        elif action == "update_status":
+            status = request.form.get("status", "In Progress")
+            with db() as conn:
+                conn.execute("UPDATE interns SET status=? WHERE id=?", (status, r["id"]))
+            add_history(r["id"], "Status changed", status)
+            flash("Task status updated.")
+        return redirect(url_for("intern_task", token=token))
+
+    r = get_by_token(token)
+    content = """
+    <div class="card"><p class="small">Personal intern task page</p><h1>Hello, {{r.name}}!</h1><h2>{{r.task_title}}</h2>
+    <p><strong>Task requirements</strong></p><p style="white-space:pre-wrap">{{r.requirements or 'Your admin has not added detailed requirements yet.'}}</p>
+    <div class="grid"><div><span class="small">Review frequency</span><h3>{{r.review_frequency}}</h3></div><div><span class="small">Next review date</span><h3>{{r.next_review_date or 'Not scheduled'}}</h3></div><div><span class="small">Task status</span><h3>{{r.status}}</h3></div></div>
+    {% if r.meeting_link %}<p><a class="btn secondary" href="{{r.meeting_link}}" target="_blank" rel="noopener">Join review meeting</a></p>{% endif %}</div>
+    <div class="card"><h2>AI voice assistant</h2><p>Press the button to hear your task and requirements. You can also ask a question using your microphone if your browser supports voice recognition.</p>
+    <button type="button" onclick="speakTask()">🔊 Explain task aloud</button> <button type="button" class="secondary" onclick="startVoiceQuestion()">🎙️ Ask a question by voice</button>
+    <p id="voiceStatus" class="small" aria-live="polite">Voice assistant ready. Allow microphone access when prompted.</p>
+    <div id="answer" class="notice" style="display:none;white-space:pre-wrap"></div>
+    <form method="post"><input type="hidden" name="action" value="complete_explanation"><button class="secondary">Mark explanation complete and email me</button></form></div>
+    <div class="card"><h2>Submit your task document</h2><p class="small">Accepted file formats: PDF, DOCX, TXT, MD.</p><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="document"><input type="file" name="document" accept=".pdf,.docx,.txt,.md" required><p><button>Submit document</button></p></form>
+    {% if r.document_filename %}<p>Latest document: {{r.document_filename}}</p><form method="post"><input type="hidden" name="action" value="review"><button>Review document with AI</button></form>{% endif %}</div>
+    {% if r.ai_suggestions %}<div class="card"><h2>Review feedback and improvements</h2><div style="white-space:pre-wrap">{{r.ai_suggestions}}</div></div>{% endif %}
+    <div class="card"><h2>Share your feedback</h2><form method="post"><input type="hidden" name="action" value="feedback"><label>How helpful was the explanation/review?</label><textarea name="feedback" placeholder="Write your feedback here">{{r.feedback}}</textarea><p><button>Submit feedback</button></p></form></div>
+    <div class="card"><h2>Task status</h2><form method="post"><input type="hidden" name="action" value="update_status"><label>Update status</label><select name="status">{% for s in ['Not Started','In Progress','Under Review','Changes Required','Approved','Completed'] %}<option {% if r.status==s %}selected{% endif %}>{{s}}</option>{% endfor %}</select><p><button>Save status</button></p></form><p class="small">When you choose Completed or Approved, recurring reminders stop.</p></div>
+    <script>
+    const task = {{ (r.task_title or '')|tojson }};
+    const requirements = {{ (r.requirements or '')|tojson }};
+    function speak(text) {
+      if (!('speechSynthesis' in window)) { document.getElementById('voiceStatus').textContent='This browser does not support text-to-speech. Please use an updated Chrome or Edge browser.'; return; }
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 0.95;
+      const voices = window.speechSynthesis.getVoices();
+      const englishVoice = voices.find(v => /en-IN|en-US|en-GB/i.test(v.lang));
+      if (englishVoice) utterance.voice = englishVoice;
+      utterance.onstart = () => document.getElementById('voiceStatus').textContent='Speaking...';
+      utterance.onend = () => document.getElementById('voiceStatus').textContent='Explanation finished.';
+      window.speechSynthesis.speak(utterance);
+    }
+    function speakTask() {
+      speak('Hello {{r.name|e}}. Your assigned task is: ' + task + '. The task requirements are: ' + (requirements || 'Please contact your admin for detailed requirements.') + '. Read the requirements carefully, prepare your document, submit it here, and check the review feedback.');
+    }
+    async function startVoiceQuestion() {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) { document.getElementById('voiceStatus').textContent='Voice recognition is not supported in this browser. Try Chrome or Edge on HTTPS or localhost.'; return; }
+      const rec = new SR(); rec.lang = 'en-IN'; rec.interimResults = false; rec.maxAlternatives = 1;
+      document.getElementById('voiceStatus').textContent='Listening. Please ask your question.';
+      rec.onresult = async (event) => {
+        const question = event.results[0][0].transcript;
+        document.getElementById('voiceStatus').textContent='You asked: ' + question + '. Getting answer...';
+        try {
+          const res = await fetch('/api/voice-answer/{{r.task_link_token}}', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question})});
+          const data = await res.json();
+          const answer = data.answer || data.error || 'Sorry, I could not prepare an answer.';
+          const box = document.getElementById('answer'); box.style.display='block'; box.textContent=answer;
+          speak(answer);
+        } catch(e) { document.getElementById('voiceStatus').textContent='Could not contact the server. Check that the Python app is running.'; }
+      };
+      rec.onerror = (e) => document.getElementById('voiceStatus').textContent='Microphone error: ' + e.error;
+      rec.start();
+    }
+    </script>
+    """
+    return render_template_string(
+        """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Your Task</title>""" + BASE_STYLE + """</head><body><header><strong>AI Intern Task Management</strong><span>Intern workspace</span></header><main>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class="card">{{m}}</div>{% endfor %}{% endwith %}""" + content + """</main></body></html>""", r=r)
+
+@app.route("/api/voice-answer/<token>", methods=["POST"])
+def voice_answer(token):
+    r = get_by_token(token)
+    if not r: return {"error": "Invalid task link."}, 404
+    question = (request.json or {}).get("question", "").strip()
+    if not question: return {"error": "Please ask a question."}, 400
+    answer, err = ask_ai(
+        "You are a patient human-like intern mentor. Answer in simple, clear language. Focus on the intern's task and requirements. Do not invent company rules. Keep the answer concise and practical.",
+        f"Intern task: {r['task_title']}\nRequirements: {r['requirements']}\nIntern question: {question}"
+    )
+    if not answer:
+        return {"error": err or "AI is not configured."}, 503
+    add_history(r["id"], "Voice question", question)
+    return {"answer": answer}
+
+@app.route("/import", methods=["POST"])
+@login_required
+def import_excel():
+    file = request.files.get("file")
+    if not file or not file.filename.lower().endswith(".xlsx"):
+        flash("Please upload an .xlsx Excel file.")
+        return redirect(url_for("dashboard"))
+    try:
+        wb = load_workbook(file, data_only=True)
+        sheet = wb.active
+        raw = list(sheet.iter_rows(values_only=True))
+        if not raw:
+            flash("Excel file is empty.")
+            return redirect(url_for("dashboard"))
+        headers = [str(h).strip().lower() if h is not None else "" for h in raw[0]]
+        def val(row, *names, default=""):
+            for n in names:
+                if n.lower() in headers:
+                    v = row[headers.index(n.lower())]
+                    return "" if v is None else str(v).strip()
+            return default
+        count = 0
+        with db() as conn:
+            for row in raw[1:]:
+                if not row or not any(x is not None and str(x).strip() for x in row):
+                    continue
+                name = val(row, "Intern Name", "Name")
+                email = val(row, "Email ID", "Email")
+                task = val(row, "Assigned Task", "Task Title", "Task")
+                if not name or not email or not task:
+                    continue
+                code = val(row, "Intern ID", "Intern Code") or f"INT-{uuid.uuid4().hex[:6].upper()}"
+                requirements = val(row, "Task Requirements", "Requirements")
+                frequency = val(row, "Review Frequency", default="2 days")
+                if frequency not in ("2 days", "1 week"): frequency = "2 days"
+                next_date = val(row, "Next Review Date") or (date.today() + timedelta(days=review_days(frequency))).isoformat()
+                token = make_token()
+                meeting = val(row, "Review Meeting Link", "Meeting Link")
+                try:
+                    conn.execute("""INSERT INTO interns (intern_code,name,email,task_title,requirements,task_link_token,review_frequency,next_review_date,meeting_link,status,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (code, name, email, task, requirements, token, frequency, next_date, meeting, "Not Started", now_iso()))
+                    count += 1
+                except sqlite3.IntegrityError:
+                    # Existing intern ID: update the row but keep their existing personal token.
+                    conn.execute("""UPDATE interns SET name=?,email=?,task_title=?,requirements=?,review_frequency=?,next_review_date=?,meeting_link=? WHERE intern_code=?""",
+                    (name,email,task,requirements,frequency,next_date,meeting,code))
+        flash(f"Import complete. Added or updated {count} rows. Check the dashboard for personal links.")
+    except Exception as exc:
+        flash(f"Could not import Excel: {exc}")
+    return redirect(url_for("dashboard"))
+
+@app.route("/export.xlsx")
+@login_required
+def export_excel():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM interns ORDER BY id").fetchall()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Intern Tracker"
+    headers = ["Intern ID","Intern Name","Email ID","Assigned Task","Task Requirements","Task Link","Explanation Status","Explanation Completed Date","Document Link","Missing Requirements","AI Suggestions / Enhancements","Intern Feedback","Review Frequency","Next Review Date","Review Meeting Link","Task Status","Last Email Sent"]
+    ws.append(headers)
+    for r in rows:
+        ws.append([
+            r["intern_code"],r["name"],r["email"],r["task_title"],r["requirements"],
+            request.url_root.rstrip("/") + "/task/" + r["task_link_token"],
+            "Completed" if r["explanation_completed"] else "Pending",r["explanation_completed_at"],
+            r["document_filename"],r["missing_requirements"],r["ai_suggestions"],r["feedback"],
+            r["review_frequency"],r["next_review_date"],r["meeting_link"],r["status"],r["last_email_sent"]
+        ])
+    for c in ws[1]:
+        c.font = c.font.copy(bold=True, color="FFFFFF")
+        c.fill = __import__("openpyxl").styles.PatternFill("solid", fgColor="1F4E78")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for col in ws.columns:
+        letter = col[0].column_letter
+        ws.column_dimensions[letter].width = min(max(max(len(str(c.value or "")) for c in col) + 2, 14), 42)
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return send_file(stream, as_attachment=True, download_name="AI_Intern_Task_Management_Export.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/template.xlsx")
+@login_required
+def download_template():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Intern Import"
+    ws.append(["Intern ID","Intern Name","Email ID","Assigned Task","Task Requirements","Review Frequency","Next Review Date","Review Meeting Link"])
+    for i in range(1, 101):
+        ws.append([f"INT-{i:03d}", "", "", "", "", "2 days", (date.today()+timedelta(days=2)).isoformat(), ""])
+    for c in ws[1]:
+        c.font = c.font.copy(bold=True, color="FFFFFF")
+        c.fill = __import__("openpyxl").styles.PatternFill("solid", fgColor="1F4E78")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    widths = [16,24,30,32,42,20,20,36]
+    for i,w in enumerate(widths,1): ws.column_dimensions[__import__("openpyxl").utils.get_column_letter(i)].width = w
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return send_file(stream, as_attachment=True, download_name="Intern_Import_Template.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/intern/<int:intern_id>/history")
+@login_required
+def history(intern_id):
+    r = get_intern(intern_id)
+    if not r: abort(404)
+    with db() as conn:
+        entries = conn.execute("SELECT * FROM review_history WHERE intern_id=? ORDER BY id DESC", (intern_id,)).fetchall()
+    content = """<div class="card"><h1>History: {{r.name}}</h1><p><a class="btn secondary" href="{{url_for('dashboard')}}">Back to dashboard</a></p><table><tr><th>Date</th><th>Event</th><th>Notes</th></tr>{% for e in entries %}<tr><td>{{e.review_date}}</td><td>{{e.review_type}}</td><td style="white-space:pre-wrap">{{e.notes}}</td></tr>{% endfor %}</table></div>"""
+    return render_template_string(
+        """<!doctype html><html><head><meta charset="utf-8">""" + BASE_STYLE + """</head><body><header><strong>AI Intern Task Management</strong><a style="color:white" href="{{url_for('dashboard')}}">Dashboard</a></header><main>""" + content + """</main></body></html>""", r=r, entries=entries)
+
+if __name__ == "__main__":
+    print("\nAI Intern Task Management is starting...")
+    print("Admin login: http://127.0.0.1:5000/login")
+    print("Default username: admin")
+    print("Default password: ChangeMe123! (change it in app.py)")
+    print("Reminder emails work only when SMTP is configured and the app stays running.")
+    app.run(host="127.0.0.1", port=5000, debug=False)
